@@ -201,6 +201,8 @@ class Package_PHP_CHM extends Package_PHP_ChunkedXHTML
     protected $hhkStream;
     // Project files Output directory
     protected $chmdir;
+    protected $supportedCharacters = array();
+
 
     public function __construct(
         Config $config,
@@ -408,11 +410,15 @@ res' . DIRECTORY_SEPARATOR . 'style.css
         $header = parent::header($id);
 
         $patterns = array(
+            '/charset=UTF-8/',                     // Replace charset
             '/(.*)(\r|\n|\r\n|\n\r)(.*)<\/head>/', // Add CSS link and <meta http-equiv="X-UA-Compatible" content="IE=edge" /> to <head>.
             '/(<body)/',                           // Add 'docs' class to body - the new CSS styling requires a parent of class 'docs'.
         );
 
+        $mime_charset = $this->LANGUAGES[$this->config->language]["mime_charset_name"];
+
         $replacements = array(
+            'charset='.$mime_charset,
             '$1  <meta http-equiv="X-UA-Compatible" content="IE=edge" />$2  <link media="all" rel="stylesheet" type="text/css" href="style.css"/>$2$3</head>',
             '$1 class="docs"',
         );
@@ -458,5 +464,116 @@ res' . DIRECTORY_SEPARATOR . 'style.css
     protected function footerSearch(): string
     {
         return '';
+    }
+
+    public function writeChunk($id, $fp) {
+        $this->onNewPage();
+        $filename = $this->getOutputDir() . $id . $this->getExt();
+        $charset = $this->LANGUAGES[$this->config->language]["preferred_charset"];
+
+        rewind($fp);
+
+        $content = $this->header($id).stream_get_contents($fp).$this->footer($id);
+
+        // Replacements based (mostly) on DBCSFix
+        $replacements = array(
+            '00A0' => '&nbsp;',  // No-Break Space (NBSP)
+            '00A9' => '&copy;',  // Copyright Sign
+            '00AE' => '&reg;',   // Registered Sign
+            '2011' => '-',       // Non-Breaking Hyphen
+            '2013' => '-',       // En Dash
+            '2014' => '&mdash;', // Em Dash
+            '2018' => '\'',      // Left Single Quotation Mark
+            '2019' => '\'',      // Right Single Quotation Mark
+            '201C' => '"',       // Left Double Quotation Mark
+            '201D' => '"',       // Right Double Quotation Mark
+            '2026' => '...',     // Horizontal Ellipsis
+            '2122' => '&trade;', // Trade Mark Sign
+            '2212' => '&minus;', // Minus Sign
+            '2264' => '<=',      // Less-Than or Equal To
+            '2265' => '>='       // Greater-Than or Equal To
+        );
+        if ($charset == 'CP932') {
+            $replacements['00A0'] = ' '; // No-Break Space (NBSP)
+        }
+        if ($charset == 'Windows-1252') {
+            $replacements['2014'] = '-'; // Em Dash
+        }
+        $search = array();
+        $replace = array();
+        foreach ($replacements as $codepoint => $replacement) {
+            $search[] = '/\x{'.$codepoint.'}/u';
+            $replace[] = $replacement;
+        }
+
+        if (!isset($this->supportedCharacters[$charset])) {
+            $mapping = __INSTALLDIR__ . "/mappings/" . $charset . ".txt";
+
+            if (is_readable($mapping)) {
+                $this->supportedCharacters[$charset] = array();
+
+                foreach(file($mapping) as $line) {
+                    if(preg_match("/^0x([0-9A-F]{2,4})\t0x([0-9A-F]{4})/", $line, $matches)) {
+                        $this->supportedCharacters[$charset][] = hexdec($matches[2]);
+                    }
+                }
+            } else {
+                $this->outputHandler->v("Unable to load character set mapping for " . $charset . ", exiting", VERBOSE_MESSAGES);
+                die;
+            }
+        }
+
+        $content = preg_replace($search, $replace, $content);
+        $content = preg_replace_callback("/[\x{0080}-\x{10FFFF}]/u", [$this, 'callbackEncodeUnsupportedCharacters'], $content);
+
+        if (in_array($charset, mb_list_encodings())) {
+            $content = mb_convert_encoding($content, $charset, 'UTF-8');
+        } else {
+            $content = iconv('UTF-8', $charset, $content);
+        }
+
+        file_put_contents($filename, $content);
+    }
+
+    private function callbackEncodeUnsupportedCharacters($matches) {
+        $charset = $this->LANGUAGES[$this->config->language]["preferred_charset"];
+        $code = mb_ord($matches[0]);
+
+        if (in_array($code, $this->supportedCharacters[$charset])) {
+            return $matches[0];
+        } else {
+            return '&#x'.sprintf('%04x', $code).';';
+        }
+    }
+
+    public function fetchStylesheet($name = null) {
+        parent::fetchStylesheet($name);
+
+        // HTML Help viewer (at least the standard one in Windows) does not support css variables, replace them with their values
+        $stylesDir = $this->getOutputDir().'styles/';
+        $search = array();
+        $replace = array();
+        $css = array();
+
+        foreach ($this->stylesheets as $style) {
+            $css[$style] = file_get_contents($stylesDir.$style);
+            if (preg_match_all("/\ \ (--[a-z\-]+):\ (.+);/", $css[$style], $matches)) {
+                foreach ($matches[1] as $idx => $var) {
+                    $search[] = 'var('.$var.')';
+                    $replace[] = $matches[2][$idx];
+                }
+            }
+        }
+        for ($i = 0; $i < count($this->stylesheets); $i++) { // Variables from one file can be used as value for variables in another, use multiple passes to remove all
+            foreach ($css as $style => $content) {
+                $css[$style] = str_replace($search, $replace, $content);
+            }
+        }
+        foreach ($css as $style => $content) {
+            $css[$style] = preg_replace("/:root\ {[^}]+}/", '', $content);
+        }
+        foreach ($css as $style => $content) {
+            file_put_contents($stylesDir.$style, $content);
+        }
     }
 }
